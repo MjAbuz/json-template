@@ -1,0 +1,38 @@
+#!/bin/bash
+#
+# Auto-deployment.
+
+set -o nounset
+set -o errexit
+
+tin() {
+  $CDI_DEPS/tin.tin "$@"
+}
+
+# . is to import bin.jsont
+# python is to import json-template
+readonly pypath=.:python:$CDI_DEPS/docopt-master:$CDI_DEPS/simplejson-2.6.2
+
+Build() {
+  PYTHONPATH=$pypath tin build-python bin.jsont --output=$CDI_OUT/jsont.tin
+
+  #poly build doc/
+}
+
+Test() {
+  echo 'TODO'
+  exit 0
+}
+
+Deploy() {
+  set -o nounset
+
+  # CWD should be build dir?  Then just copy it?
+  scp \
+    $CDI_OUT/jsont.tin \
+    $CDI_DEPLOY_DEST/json-template/latest/
+
+  # TODO: Deploy the Poly doc app.
+}
+
+"$@"

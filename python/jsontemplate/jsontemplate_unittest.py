@@ -49,6 +49,32 @@ text
 """)
     self.verify.Equal(len(tokens), 17)
 
+  def testTokenRegexIgnoresCode(self):
+    # Special case:
+    s = jsontemplate.expand('{foo}', {'foo': 'bar'})
+    self.verify.Equal('bar', s)
+
+    s = jsontemplate.expand('{.repeated section foo}{@}{.end}',
+                            {'foo': ['a', 'b', 'c']})
+    self.verify.Equal('abc', s)
+
+    # This didn't used to work because the variable would be " foo" and it would
+    # be undefined.  Now we just let it pass through as literal text.
+    s = jsontemplate.expand('{ foo}', {'foo': 'bar'})
+    self.verify.Equal('{ foo}', s)
+
+    s = jsontemplate.expand('function() { return {@}; }', 1)
+    self.verify.Equal('function() { return 1; }', s)
+
+    s = jsontemplate.expand('function() { return {@};', 1)
+    self.verify.Equal('function() { return 1;', s)
+
+    # If you have an {.end} you'll get a different error because it'll be
+    # unmatched
+    s = jsontemplate.expand('{ .repeated section foo}',
+                            {'foo': ['a', 'b', 'c']})
+    self.verify.Equal('{ .repeated section foo}', s)  # ignored
+
   def testSectionRegex(self):
 
     # Section names are required
@@ -114,7 +140,7 @@ Hello <there>
 
   def testEncoding(self):
     # Bug fix: Templates that are Unicode strings should expand as Unicode
-    # strings
+    # strings.  (This is why we use StringIO instead of cStringIO).
     t = jsontemplate.FromString(u'\u00FF')
     self.verify.Equal(t.expand({}), u'\u00FF')
 
@@ -298,9 +324,33 @@ class InternalTemplateTest(taste.Test):
 
     self.verify.Equal(t.expand({u'name': u'World'}), u'Hello World')
 
-    # TODO: Need a lot more comprehensive *external* unicode tests, as well as
-    # ones for the internal API.  Need to test mixing of unicode() and str()
-    # instances (or declare it undefined).
+  def testUnicodeTemplateMixed(self):
+    # Unicode template
+    t = jsontemplate.Template(u'Hello {name}')
+
+    # Encoded utf-8 data is OK
+    self.verify.Equal(t.expand({u'name': '\xc2\xb5'}), u'Hello \xb5')
+
+    # Latin-1 data is not OK
+    self.verify.Raises(UnicodeDecodeError, t.expand, {u'name': '\xb5'})
+
+    # Byte string \0 turns into code point 0
+    self.verify.Equal(t.expand({u'name': '\0'}), u'Hello \u0000')
+
+  def testByteTemplateMixed(self):
+
+    # (Latin-1) Byte string template
+    t = jsontemplate.Template('Hello \xb5 {name}')
+
+    # Byte string OK
+    self.verify.Equal(t.expand({u'name': '\xb5'}), 'Hello \xb5 \xb5')
+
+    self.verify.Raises(UnicodeDecodeError, t.expand, {u'name': u'\u00b5'})
+
+    # Byte string template without any special chars
+    t = jsontemplate.Template('Hello {name}')
+    # Unicode data is OK
+    self.verify.Equal(t.expand({u'name': u'\u00b5'}), u'Hello \u00B5')
 
   def testRepeatedSectionFormatter(self):
     def _Columns(x):
@@ -330,7 +380,7 @@ class InternalTemplateTest(taste.Test):
         t.expand(d))
 
   def testExpandWithStyle(self):
-    # TODO: REMOVE with execute_with_style_LEGACY
+    # TODO: REMOVE with expand_with_style and execute_with_style_LEGACY
     data = {
         'title': 'Greetings!',
         'body': {'names': ['andy', 'bob']},
@@ -354,6 +404,39 @@ class InternalTemplateTest(taste.Test):
     self.verify.Raises(
         jsontemplate.EvaluationError,
         jsontemplate.expand_with_style, body_template, style, data, 'foo')
+
+    # New style with old API
+    body_template = jsontemplate.Template(B("""
+        {.define TITLE}
+        Definition of '{word}'
+        {.end}
+
+        {.define BODY}
+          <h3>{.template TITLE}</h3>
+          {definition}
+        {.end}
+        """))
+
+    style = jsontemplate.Template(B("""
+        <title>{.template TITLE}</title>
+        <body>
+        {.template BODY}
+        </body>
+        """))
+    data = {
+        'word': 'hello',
+        'definition': 'greeting',
+        }
+    s = jsontemplate.expand_with_style(body_template, style, data)
+    self.verify.LongStringsEqual(B("""
+        <title>Definition of 'hello'
+        </title>
+        <body>
+          <h3>Definition of 'hello'
+        </h3>
+          greeting
+        </body>
+        """), s)
 
 
 class FunctionsApiTest(taste.Test):
@@ -541,13 +624,52 @@ class TemplateGroupTest(taste.Test):
         b.txt
         """), ignore_all_whitespace=True)
 
-  def testStyles(self):
-    # This uses the expand_with_style API -- convert it
-    data = {
-        'word': 'hello',
-        'definition': 'greeting',
-        }
-    # TITLE is reused
+  def testMultipleTemplateGroups(self):
+    style = jsontemplate.Template('')
+    body = jsontemplate.Template('')
+    jsontemplate.MakeTemplateGroup({'style': style, 'body': body})
+    # Can't do it twice
+    self.verify.Raises(
+        jsontemplate.UsageError,
+        jsontemplate.MakeTemplateGroup,
+        {'style': style, 'body': body})
+
+  def testConflictingGroups(self):
+    t = jsontemplate.Template(B("""
+        {.define TITLE}
+        Definition of '{word}'
+        {.end}
+
+        {.define BODY}
+          <h3>{.template TITLE}</h3>
+          {definition}
+        {.end}
+        """))
+    # TODO: Re-enable when Poly is updated
+    #self.verify.Raises(
+    #    jsontemplate.UsageError,
+    #    jsontemplate.MakeTemplateGroup,
+    #    {'body': t})
+
+
+class StylesTest(taste.Test):
+
+  # Used in multiple tests
+  STYLE = jsontemplate.Template(B("""
+      <title>{.template TITLE}</title>
+      <body>
+      {.template BODY}
+      </body>
+      """))
+
+  DATA = {
+      'word': 'hello',
+      'definition': 'greeting',
+      }
+
+  def testTemplateReference(self):
+
+    # TITLE is referenced
     body_template = jsontemplate.Template(B("""
         {.define TITLE}
         Definition of '{word}'
@@ -558,13 +680,9 @@ class TemplateGroupTest(taste.Test):
           {definition}
         {.end}
         """))
-    style = jsontemplate.Template(B("""
-        <title>{.template TITLE}</title>
-        <body>
-        {.template BODY}
-        </body>
-        """))
-    s = body_template.expand(data, style=style)
+
+    s = body_template.expand(self.DATA, style=self.STYLE)
+
     self.verify.LongStringsEqual(B("""
         <title>Definition of 'hello'
         </title>
@@ -575,6 +693,8 @@ class TemplateGroupTest(taste.Test):
         </body>
         """), s)
 
+
+  def testOption(self):
     # Now do it with "strip-line"
     body_template = jsontemplate.Template(B("""
         {.OPTION strip-line}
@@ -589,18 +709,50 @@ class TemplateGroupTest(taste.Test):
         {.end}
         """))
 
-    style = jsontemplate.Template(B("""
-        <title>{.template TITLE}</title>
-        <body>
-        {.template BODY}
-        </body>
-        """))
-    s = body_template.expand(data, style=style)
+    s = body_template.expand(self.DATA, style=self.STYLE)
     self.verify.LongStringsEqual(B("""
         <title>Definition of 'hello'</title>
         <body>
           <h3>Definition of 'hello'</h3>
           greeting
+        </body>
+        """), s)
+
+  def testStyleWithTemplateGroup(self):
+    body_template = jsontemplate.Template(B("""
+        {.define TITLE}
+        Definition of '{word}'
+        {.end}
+
+        {.define BODY}
+          <h3>{.template TITLE}</h3>
+          {definition}
+        {.template t1}
+        {@|template t1}
+        {word|template t2}
+        {.end}
+        """))
+    t1 = jsontemplate.Template('T1')
+    t2 = jsontemplate.Template('{@}')
+
+    # Create a template group, and make sure it doesn't mess up how .template
+    # TITLE is referenced.
+    jsontemplate.MakeTemplateGroup({
+        'body': body_template,
+        't1': t1,
+        't2': t2,
+        })
+
+    s = body_template.expand(self.DATA, style=self.STYLE)
+    self.verify.LongStringsEqual(B("""
+        <title>Definition of 'hello'
+        </title>
+        <body>
+          <h3>Definition of 'hello'
+        </h3>
+          greeting
+        T1T1
+        hello
         </body>
         """), s)
 

@@ -23,6 +23,33 @@ methods, which allow Template constructor options to be embedded in the template
 string itself.
 
 Other functions are exposed for tools which may want to process templates.
+
+Unicode
+-------
+
+JSON Template can work on unicode strings or byte strings.  The template parser
+and expansion loop don't care which type they get.
+
+However, it's up to the caller to ensure that they get *compatible* types.
+Python auto-conversion can make this a bit confusing.
+
+If you have a byte string template and a dictionary with byte strings, expansion
+will work:
+
+'Hello {name}' +  {name: '\xb5'}  ->  'Hello \xb5'
+
+If you have a unicode template and unicode data in the dictionary, it will work:
+
+u'Hello {name}' +  {name: u'\u00B5'}  ->  u'Hello \u00B5'
+
+If you have a unicode template and byte string data, Python will try to decode
+the byte strings using the utf-8 encoding.  This may not be possible, in which
+case you'll get a UnicodeDecodeError.
+
+u'Hello {name}' +  {name: 'there'}  ->  'Hello there'
+u'Hello {name}' +  {name: '\xb5'}     ->  ERROR: \xb5 is not decodable as ASCII
+
+Mixing types may incur a performance penalty.
 """
 
 __author__ = 'Andy Chu'
@@ -67,6 +94,10 @@ class Error(Exception):
       return '%s\n\nNear: %s' % (self.args[0], pprint.pformat(self.near))
     else:
       return self.args[0]
+
+
+class UsageError(Error):
+  """Errors in using the API, not a result of compilation or evaluation."""
 
 
 class CompilationError(Error):
@@ -216,14 +247,17 @@ class _TemplateRef(object):
   """A reference from one template to another.
   
   The _TemplateRef sits statically in the program tree as one of the formatters.
-  At runtime, _DoSubstitute calls Resolve() with the template_map being used.
+  At runtime, _DoSubstitute calls Resolve() with the group being used.
   """
-  def __init__(self, name):
+  def __init__(self, name=None, template=None):
     self.name = name
+    self.template = template  # a template that's already been resolved
 
   def Resolve(self, context):
-    if context.template_map:
-      return context.template_map.get(self.name)
+    if self.template:
+      return self.template
+    if context.group:
+      return context.group.get(self.name)
     else:
       raise EvaluationError(
           "Couldn't find template with name %r (create a template group?)"
@@ -251,15 +285,16 @@ class _TemplateRegistry(FunctionRegistry):
       ref: Either a template instance (itself) or _TemplateRef
     """
     prefix = 'template '
-    result = None  # fail the lookup by default
+    ref = None  # fail the lookup by default
     if user_str.startswith(prefix):
       name = user_str[len(prefix):]
       if name == 'SELF':
-        result = self.owner
+        # we can resolve this right away
+        ref = _TemplateRef(template=self.owner)  # special value
       else:
-        result = _TemplateRef(name)
+        ref = _TemplateRef(name)
 
-    return result, (), TEMPLATE_FORMATTER
+    return ref, (), TEMPLATE_FORMATTER
 
 
 class ChainedRegistry(FunctionRegistry):
@@ -525,20 +560,20 @@ class _ScopedContext(object):
   """Allows scoped lookup of variables.
 
   If the variable isn't in the current context, then we search up the stack.
-  This object also stores the template_map.
+  This object also stores the group.
   """
 
-  def __init__(self, context, undefined_str, template_map=None):
+  def __init__(self, context, undefined_str, group=None):
     """
     Args:
       context: The root context
       undefined_str: See Template() constructor.
-      template_map: Used by the {.if template FOO} predicate, and _DoSubstitute
+      group: Used by the {.if template FOO} predicate, and _DoSubstitute
           which is passed the context.
     """
     self.stack = [_Frame(context)]
     self.undefined_str = undefined_str
-    self.template_map = template_map  # used by _DoSubstitute?
+    self.group = group  # used by _DoSubstitute?
     self.root = context
 
   def Root(self):
@@ -546,9 +581,9 @@ class _ScopedContext(object):
     return self.root
 
   def HasTemplate(self, name):
-    if not self.template_map:  # Could be None?
+    if not self.group:  # Could be None?
       return False
-    return name in self.template_map
+    return name in self.group
 
   def PushSection(self, name, pre_formatters):
     """Given a section name, push it on the top of the stack.
@@ -559,7 +594,12 @@ class _ScopedContext(object):
     if name == '@':
       value = self.stack[-1].context
     else:
-      value = self.stack[-1].context.get(name)
+      top = self.stack[-1].context
+      try:
+        value = top.get(name)
+      except AttributeError:  # no .get()
+        raise EvaluationError(
+            "Can't get name %r from top value %s" % (name, top))
 
     # Apply pre-formatters
     for i, (f, args, formatter_type) in enumerate(pre_formatters):
@@ -658,7 +698,9 @@ class _ScopedContext(object):
 
 
 def _ToString(x):
-  # Some cross-language values for primitives
+  """The default default formatter!."""
+  # Some cross-language values for primitives.  This is tested in
+  # jsontemplate_test.py.
   if x is None:
     return 'null'
   if isinstance(x, basestring):
@@ -745,6 +787,9 @@ _DEFAULT_FORMATTERS = {
     # this could be lambda x: json.dumps(x, indent=2), but here we want to be
     # compatible to Python 2.4.
     'str': _ToString,
+    # Python-specific representation for safely debugging any value as an ASCII
+    # string (unicode can cause issues when using 'str')
+    'repr': repr,
 
     'upper': lambda x: x.upper(),
     'lower': lambda x: x.lower(),
@@ -898,12 +943,13 @@ def MakeTokenRegex(meta_left, meta_right):
   key = meta_left, meta_right
   if key not in _token_re_cache:
     # - Need () grouping for re.split
-    # - For simplicity, we allow all characters except newlines inside
-    #   metacharacters ({} / [])
+    # - The first character must be a non-space.  This allows us to ignore
+    # literals like function() { return 1; } when
+    # - There must be at least one (non-space) character inside {}
     _token_re_cache[key] = re.compile(
         r'(' +
         re.escape(meta_left) +
-        r'.*?' +
+        r'\S.*?' +
         re.escape(meta_right) +
         r')')
   return _token_re_cache[key]
@@ -1126,7 +1172,7 @@ def _CompileTemplate(
   balance_counter = 0
   comment_counter = 0  # ditto for ##BEGIN/##END
 
-  has_defines = False  # TODO: REMOVE with execute_with_style_LEGACY
+  has_defines = False
 
   for token_type, token in _Tokenize(template_str, meta_left, meta_right,
                                      whitespace):
@@ -1157,7 +1203,6 @@ def _CompileTemplate(
         formatters = parts[1:]
       builder.NewSection(token_type, name, formatters)
       balance_counter += 1
-      # TODO: REMOVE with execute_with_style_LEGACY
       if token_type == DEF_TOKEN:
         has_defines = True
       continue
@@ -1301,26 +1346,6 @@ def FromFile(f, more_formatters=lambda x: None, more_predicates=lambda x: None,
                       **options)
 
 
-def _MakeTemplateMap(root_section):
-  """Construct a dictinary { template name -> Template() instance }
-
-  Args:
-    root_section: _Section instance -- root of the original parse tree
-  """
-  template_map = {}
-  for statement in root_section.Statements():
-    if isinstance(statement, basestring):
-      continue
-    func, args = statement
-    # here the function acts as ID for the block type
-    if func is _DoDef and isinstance(args, _Section):
-      section = args
-      # Construct a Template instance from a this _Section subtree
-      t = Template._FromSection(section, template_map)
-      template_map[section.section_name] = t
-  return template_map
-
-
 class Template(object):
   """Represents a compiled template.
 
@@ -1366,35 +1391,46 @@ class Template(object):
     It also accepts all the compile options that _CompileTemplate does.
     """
     r = _TemplateRegistry(self)
-    self.template_map = None  # optionally set by _SetTemplateMap
+    self.undefined_str = undefined_str
+    self.group = {}  # optionally updated by _UpdateTemplateGroup
     builder = _ProgramBuilder(more_formatters, more_predicates, r)
     # None used by _FromSection
     if template_str is not None:
-      # TODO: Remove has_defines along with execute_with_style_LEGACY
       self._program, self.has_defines = _CompileTemplate(
           template_str, builder, **compile_options)
-    self.undefined_str = undefined_str
+      self.group = _MakeGroupFromRootSection(self._program, self.undefined_str)
 
   @staticmethod
-  def _FromSection(section, template_map):
-    t = Template(None)  # NOTE: we lost undefined_str
+  def _FromSection(section, group, undefined_str):
+    t = Template(None, undefined_str=undefined_str)
     t._program = section
     t.has_defines = False
-    # This "subtemplate" needs the template_map too for its own references
-    t.template_map = template_map
+    # This "subtemplate" needs the group too for its own references
+    t.group = group
     return t
 
   def _Statements(self):
     # for execute_with_style
     return self._program.Statements()
 
-  def _SetTemplateMap(self, template_map):
-    """Allow this template to reference templates in the group via formatters.
+  def _UpdateTemplateGroup(self, group):
+    """Allow this template to reference templates in the group.
 
     Args:
-      template_map: dictionary of template name -> compiled Template instance
+      group: dictionary of template name -> compiled Template instance
     """
-    self.template_map = template_map
+    # TODO: Re-enable when Poly is converted
+    #if self.has_defines:
+    #  raise UsageError(
+    #      "Can't make a template group out of a template with {.define}.")
+    bad = []
+    for name in group:
+      if name in self.group:
+        bad.append(name)
+    if bad:
+      raise UsageError(
+          "This template already has these named templates defined: %s" % bad)
+    self.group.update(group)
 
   def _CheckRefs(self):
     """Check that the template names referenced in this template exist."""
@@ -1407,32 +1443,21 @@ class Template(object):
   # Public API
   #
 
-  def execute(self, data_dict, callback, template_map=None, trace=None):
+  def execute(self, data_dict, callback, group=None, trace=None):
     """Low level method to expand the template piece by piece.
 
     Args:
       data_dict: The JSON data dictionary.
       callback: A callback which should be called with each expanded token.
-      template_map: Dictionary of name -> Template instance (for styles)
+      group: Dictionary of name -> Template instance (for styles)
 
     Example: You can pass 'f.write' as the callback to write directly to a file
     handle.
     """
-    # First try the passed in version, then the one set by _SetTemplateMap.  May
-    # be None.
-    # TODO: What happens if we call MakeTemplateGroup() on a template with
-    # {.defines} in it?  The internal refernces will be broken.  Options:
-    #
-    # 1. Raise an error -- only "simple" templates can be wired together with
-    # MakeTemplateGroup().
-    # 2. Somehow merge the template maps (then you have namespace conflicts of
-    # course)
-    # 
-    # This issue is caused by the weirdness where a Template() with {.defines}
-    # is actually composed of multiple Template() instances -- it is a template
-    # group.  There could be a cleaner solution.
-    tm = template_map or self.template_map
-    context = _ScopedContext(data_dict, self.undefined_str, template_map=tm)
+    # First try the passed in version, then the one set by _UpdateTemplateGroup.
+    # May be None.  Only one of these should be set.
+    group = group or self.group
+    context = _ScopedContext(data_dict, self.undefined_str, group=group)
     _Execute(self._program.Statements(), context, callback, trace)
 
   render = execute  # Alias for backward compatibility
@@ -1470,16 +1495,15 @@ class Template(object):
       style = None
 
     tokens = []
-    template_map = _MakeTemplateMap(self._program)
     if style:
-      style.execute(data_dict, tokens.append, template_map=template_map,
+      style.execute(data_dict, tokens.append, group=self.group,
                     trace=trace)
     else:
-      # Needs a template_map to reference its OWN {.define}s
-      self.execute(data_dict, tokens.append, template_map=template_map,
+      # Needs a group to reference its OWN {.define}s
+      self.execute(data_dict, tokens.append, group=self.group,
                    trace=trace)
 
-    return ''.join(tokens)
+    return JoinTokens(tokens)
 
   def tokenstream(self, data_dict):
     """Yields a list of tokens resulting from expansion.
@@ -1519,8 +1543,30 @@ class Trace(object):
     return 'Trace %s %s' % (self.exec_depth, self.template_depth)
 
 
-def MakeTemplateGroup(template_map):
+def _MakeGroupFromRootSection(root_section, undefined_str):
+  """Construct a dictinary { template name -> Template() instance }
+
+  Args:
+    root_section: _Section instance -- root of the original parse tree
+  """
+  group = {}
+  for statement in root_section.Statements():
+    if isinstance(statement, basestring):
+      continue
+    func, args = statement
+    # here the function acts as ID for the block type
+    if func is _DoDef and isinstance(args, _Section):
+      section = args
+      # Construct a Template instance from a this _Section subtree
+      t = Template._FromSection(section, group, undefined_str)
+      group[section.section_name] = t
+  return group
+
+
+def MakeTemplateGroup(group):
   """Wire templates together so that they can reference each other by name.
+
+  This is a public API.
 
   The templates becomes formatters with the 'template' prefix.  For example:
   {var|template NAME} formats the node 'var' with the template 'NAME'
@@ -1534,9 +1580,30 @@ def MakeTemplateGroup(template_map):
   Args:
     group: dictionary of template name -> compiled Template instance
   """
-  for t in template_map.itervalues():
-    t._SetTemplateMap(template_map)
+  # mutate all of the templates so that they can reference each other
+  for t in group.itervalues():
+    t._UpdateTemplateGroup(group)
     #t._CheckRefs()
+
+
+def JoinTokens(tokens):
+  """Join tokens (which may be a mix of unicode and str values).
+
+  See notes on unicode at the top.  This function allows mixing encoded utf-8
+  byte string tokens with unicode tokens.  (Python's default encoding is ASCII,
+  and we don't want to change that.)
+
+  We also want to support pure byte strings, so we can't get rid of the
+  try/except.  Two tries necessary.
+
+  If someone really wanted to use another encoding, they could monkey patch
+  jsontemplate.JoinTokens (this function).
+  """
+  try:
+    return ''.join(tokens)
+  except UnicodeDecodeError:
+    # This can still raise UnicodeDecodeError if that data isn't utf-8.
+    return ''.join(t.decode('utf-8') for t in tokens)
 
 
 def _DoRepeatedSection(args, context, callback, trace):
@@ -1634,13 +1701,7 @@ def _DoSubstitute(args, context, callback, trace):
   for i, (f, args, formatter_type) in enumerate(formatters):
     try:
       if formatter_type == TEMPLATE_FORMATTER:
-        if isinstance(f, Template):
-          template = f
-        elif isinstance(f, _TemplateRef):
-          template = f.Resolve(context)
-        else:
-          assert False, 'Invalid formatter %r' % f
-
+        template = f.Resolve(context)
         if i == last_index:
           # In order to keep less template output in memory, we can just let the
           # other template write to our callback directly, and then stop.
@@ -1650,7 +1711,7 @@ def _DoSubstitute(args, context, callback, trace):
           # We have more formatters to apply, so explicitly construct 'value'
           tokens = []
           template.execute(value, tokens.append, trace=trace)
-          value = ''.join(tokens)
+          value = JoinTokens(tokens)
 
       elif formatter_type == ENHANCED_FUNC:
         value = f(value, context, args)
@@ -1750,23 +1811,10 @@ def execute_with_style_LEGACY(template, style, data, callback, body_subtree='bod
   _FlattenToCallback(tokens, callback)
 
 
-def execute_with_style(template, style, data, callback, trace=None):
-  """Execute both a "body" template and a style with the same data dict."""
-  undefined_str = None
-  context = _ScopedContext(data, undefined_str)
-
-  # Expand into a throwaway.  The context is populated with "side effects".
-  # TODO: warn if there is anything significant here.
-  throwaway = []
-  _Execute(template._Statements(), context, throwaway.append, trace=trace)
-
-  # Now use the same context to expand the style into the callback passed by the
-  # caller.
-  _Execute(style._Statements(), context, callback, trace=trace)
-
-
 def expand_with_style(template, style, data, body_subtree='body'):
   """Expand a data dictionary with a template AND a style.
+
+  DEPRECATED -- Remove this entire function in favor of expand(d, style=style)
 
   A style is a Template instance that factors out the common strings in several
   "body" templates.
@@ -1775,18 +1823,11 @@ def expand_with_style(template, style, data, body_subtree='body'):
     template: Template instance for the inner "page content"
     style: Template instance for the outer "page style"  
     data: Data dictionary, with a 'body' key (or body_subtree
-
-    TODO: DELETE body_subtree along with execute_with_style_LEGACY
-    body_subtree: key that specifies the subtree of 'data' to expand 'template'
-                  into
   """
-  # Use the new algorithm for a template with {.define}
   if template.has_defines:
-    tokens = []
-    execute_with_style(template, style, data, tokens.append)
-    return ''.join(tokens)
+    return template.expand(data, style=style)
   else:
     tokens = []
     execute_with_style_LEGACY(template, style, data, tokens.append,
                               body_subtree=body_subtree)
-    return ''.join(tokens)
+    return JoinTokens(tokens)

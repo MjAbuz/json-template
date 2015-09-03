@@ -199,6 +199,21 @@ class WhitespaceTest(taste.Test):
     self.verify.Expansion(t, {'foo': ['a', 'b', 'c']}, 'a \t,b \t,c \t')
 
 
+class WhitespaceTest(taste.Test):
+  LABELS = ['multilanguage']
+
+  @taste.only_verify('python', 'javascript')
+  def testIgnoresCode(self):
+    # A common use case is generating code with curly braces.  We try to be more
+    # lenient by requiring "directives" to have a non-space character as the
+    # first one.
+    t = taste.ClassDef('function() { return {@}; }')
+    self.verify.Expansion(t, 1, 'function() { return 1; }')
+
+    t = taste.ClassDef('function() { return {@};')
+    self.verify.Expansion(t, 1, 'function() { return 1;')
+
+
 class SubstitutionsTest(taste.Test):
   """Language-independent tests for JSON Template."""
 
@@ -713,6 +728,26 @@ class SectionsTest(taste.PyUnitCompatibleTest):
         [.end]
         """), meta='[]')
 
+#  @taste.labels('documentation')
+  def testSectionOrInSectionRepeatedTwice(self):
+    t = taste.ClassDef(
+        B("""
+        {.section content}
+          {any_content}
+        {.or}
+          {.repeated section content_alt}
+            {any_other_content}
+          {.or}
+            No content
+          {.end}
+        {.end}
+        """))
+
+    self.verify.Expansion(t, {}, 
+        B("""
+            No content
+        """),ignore_all_whitespace=True)
+        
   @taste.labels('documentation')
   def testRepeatedSectionOr(self):
     t = taste.ClassDef(
@@ -740,7 +775,7 @@ class SectionsTest(taste.PyUnitCompatibleTest):
           Andy 20
           Bob 25
         """))
-
+        
     # Empty list
     without_people = {
         'header': 'People',
@@ -834,7 +869,6 @@ class DottedLookupTest(taste.Test):
 
   LABELS = ['multilanguage']
 
-  @taste.no_verify('java')
   def testDottedLookup(self):
     t = taste.ClassDef('{foo.bar}')
 
@@ -843,7 +877,6 @@ class DottedLookupTest(taste.Test):
         {'foo': {'bar': 'Hello'}},
         'Hello')
 
-  @taste.no_verify('java')
   def testDottedLookupErrors(self):
 
     # TODO: Also test everything with setting undefined_str
@@ -889,7 +922,6 @@ class DottedLookupTest(taste.Test):
         {'foo': {}, 'bar': 100},
         'UNDEFINED')
 
-  @taste.no_verify('java')
   def testThreeLookups(self):
     t = taste.ClassDef('{foo.bar.baz}')
 
@@ -903,7 +935,6 @@ class DottedLookupTest(taste.Test):
         t,
         {'foo': 100})
 
-  @taste.no_verify('java')
   def testScopedLookup(self):
     t = taste.ClassDef(
         B("""
